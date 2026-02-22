@@ -118,6 +118,9 @@ python train.py --config config/train/pred.yaml
 python train.py --config config/train/plan.yaml
 ```
 
+> Plan-stage RL now supports GDPO by default (`advantage_mode: "gdpo"` in `config/train/plan.yaml`).
+> Set `advantage_mode: "grpo"` to recover the original group-normalized process supervision.
+
 ---
 
 ## Validation
