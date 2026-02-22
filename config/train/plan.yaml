@@ -51,6 +51,8 @@ model:
   num_samples: 4
   beta: 0.1
   scaling_factor: 0.1
+  advantage_mode: "gdpo"
+  gdpo_eps: 1.0e-4
   dropout: 0.1
   lr: 0.000004
   weight_decay: 0.0001

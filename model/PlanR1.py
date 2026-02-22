@@ -32,6 +32,8 @@ class PlanR1(pl.LightningModule):
                  num_samples: int = 4,
                  beta: float = 0.1,
                  scaling_factor: float = 0.1,
+                 advantage_mode: str = "gdpo",
+                 gdpo_eps: float = 1e-4,
                  num_hops: int = 4,
                  num_heads: int = 8,
                  dropout: float = 0.1,
@@ -64,6 +66,8 @@ class PlanR1(pl.LightningModule):
         self.num_samples = num_samples
         self.beta = beta
         self.scaling_factor = scaling_factor
+        self.advantage_mode = advantage_mode.lower()
+        self.gdpo_eps = gdpo_eps
         self.num_hops = num_hops
         self.num_heads = num_heads
         self.dropout = dropout
@@ -342,11 +346,55 @@ class PlanR1(pl.LightningModule):
             action_step[ego_index] = ego_action_step
             data = self.transition(data, action_step)
 
-        rewards, _, valid_mask = self.reward_fn(data)
-        advantages = self.compute_ae_process_supervision(rewards, valid_mask)
+        rewards, reward_components, valid_mask = self.reward_fn(data)
+        advantages = self.compute_advantages(rewards, reward_components, valid_mask)
 
         return advantages, pred_logps, plan_logps, rewards, valid_mask
     
+    def compute_advantages(self, rewards, reward_components, valid_mask):
+        if self.advantage_mode == "gdpo":
+            return self.compute_gdpo_process_supervision(reward_components, valid_mask)
+        if self.advantage_mode == "grpo":
+            return self.compute_ae_process_supervision(rewards, valid_mask)
+        raise ValueError(f"Unsupported advantage_mode: {self.advantage_mode}")
+
+    def compute_gdpo_process_supervision(self, reward_components, valid_mask):
+        bsz, horizon, num_rewards = reward_components.shape
+
+        rewards_reshape = reward_components.view(self.num_samples, -1, horizon, num_rewards).permute(1, 0, 2, 3)
+        valid_mask_reshape = valid_mask.view(self.num_samples, -1, horizon).transpose(0, 1).unsqueeze(-1).float()
+
+        masked_rewards = rewards_reshape * valid_mask_reshape
+        denom = valid_mask_reshape.sum(dim=1, keepdim=True).clamp_min(1.0)
+        rewards_mean = masked_rewards.sum(dim=1, keepdim=True) / denom
+
+        centered = rewards_reshape - rewards_mean
+        centered = centered * valid_mask_reshape
+        rewards_std = torch.sqrt((centered ** 2).sum(dim=1, keepdim=True) / denom).clamp_min(self.gdpo_eps)
+
+        rewards_norm = centered / rewards_std
+
+        reward_weights = torch.tensor([
+            self.comfort_reward_weight,
+            self.ttc_reward_weight,
+            self.speed_limit_reward_weight,
+            self.progress_reward_weight,
+        ], device=reward_components.device, dtype=reward_components.dtype)
+        reward_weights = reward_weights / reward_weights.sum().clamp_min(self.gdpo_eps)
+
+        combined = (rewards_norm * reward_weights.view(1, 1, 1, -1)).sum(dim=-1)
+        combined = combined.transpose(0, 1).reshape(bsz, horizon)
+
+        combined[~valid_mask] = 0.0
+        advantages = torch.zeros_like(combined)
+        for step in reversed(range(horizon)):
+            if step == horizon - 1:
+                advantages[:, step] = combined[:, step]
+            else:
+                advantages[:, step] = combined[:, step] + advantages[:, step + 1] * valid_mask[:, step + 1].float()
+
+        return advantages
+
     def compute_ae_outcome_supervision(self, rewards):
         # group computation
         rewards_reshape = rewards.view(self.num_samples, -1)
@@ -406,13 +454,24 @@ class PlanR1(pl.LightningModule):
         progress_reward = progress_reward.unsqueeze(1).expand(-1, self.num_future_intervals) 
         speed_limit_reward = speed_limit_reward.unsqueeze(1).expand(-1, self.num_future_intervals)
 
-        reward = on_road_reward * obstacle_collision_reward * agent_collision_reward * (
-                 self.comfort_reward_weight * comfort_reward + 
-                 self.ttc_reward_weight * ttc_reward + 
-                 self.speed_limit_reward_weight * speed_limit_reward + 
-                 self.progress_reward_weight * progress_reward) / (self.comfort_reward_weight + self.ttc_reward_weight + self.speed_limit_reward_weight + self.progress_reward_weight)
+        safety_mask = on_road_reward * obstacle_collision_reward * agent_collision_reward
+        reward_components = torch.stack([
+            comfort_reward,
+            ttc_reward,
+            speed_limit_reward,
+            progress_reward,
+        ], dim=-1)
+        reward_components = reward_components * safety_mask.unsqueeze(-1)
 
-        return reward, done, valid_mask
+        reward_weights = torch.tensor([
+            self.comfort_reward_weight,
+            self.ttc_reward_weight,
+            self.speed_limit_reward_weight,
+            self.progress_reward_weight,
+        ], device=reward_components.device, dtype=reward_components.dtype)
+        reward = (reward_components * reward_weights.view(1, 1, -1)).sum(dim=-1) / reward_weights.sum().clamp_min(self.gdpo_eps)
+
+        return reward, reward_components, valid_mask
     
     def configure_optimizers(self):
         decay = set()
